@@ -7,6 +7,7 @@ Supports parallel processing, error logging, and resume capability.
 """
 
 import csv
+import math
 import tempfile
 import threading
 import time
@@ -17,6 +18,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
+# Default maximum pixels per dimension to prevent huge requests
+DEFAULT_MAX_PIXELS = 10000
+
 # Suppress geoutils deprecation warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="geoutils")
 warnings.filterwarnings("ignore", message="No nodata set")
@@ -24,6 +28,7 @@ warnings.filterwarnings("ignore", message="No nodata set")
 import geopandas as gpd
 import geoutils as gu
 import typer
+from pyproj import CRS
 from owslib.wcs import WebCoverageService
 from rich.console import Console
 from rich.progress import (
@@ -82,6 +87,8 @@ def download_single_polygon(
     coverage_id: str,
     output_folder: Path,
     sleep_duration: float,
+    resolution: float,
+    max_pixels: int,
 ) -> DownloadResult:
     """
     Download and mask raster for a single polygon.
@@ -94,17 +101,24 @@ def download_single_polygon(
         coverage_id: Coverage identifier
         output_folder: Directory for output files
         sleep_duration: Seconds to sleep after request
+        resolution: Output resolution in meters per pixel
+        max_pixels: Maximum pixels per dimension
 
     Returns:
         DownloadResult with success status and any error details
     """
-    output_file = output_folder / f"D_1m_{index}.tif"
+    output_file = output_folder / f"D_{resolution}m_{index}.tif"
 
     # Skip if file already exists
     if output_file.exists():
         return DownloadResult(index=index, success=True, skipped=True)
 
     try:
+        # Validate bounds are not NaN (can happen with invalid geometries)
+        bounds = [row.minx, row.miny, row.maxx, row.maxy]
+        if any(math.isnan(v) for v in bounds):
+            raise ValueError(f"Invalid geometry bounds (NaN values) for polygon {index}")
+
         wcs = get_wcs_connection(wcs_url)
 
         # Create bbox tuple for WCS 1.0.0
@@ -115,9 +129,17 @@ def download_single_polygon(
             float(row.maxy),
         )
 
-        # Calculate pixel dimensions for ~1m resolution
-        width = max(1, int(row.maxx - row.minx))
-        height = max(1, int(row.maxy - row.miny))
+        # Calculate pixel dimensions based on resolution
+        width = max(1, int((row.maxx - row.minx) / resolution))
+        height = max(1, int((row.maxy - row.miny) / resolution))
+
+        # Prevent excessively large raster requests
+        if width > max_pixels or height > max_pixels:
+            raise ValueError(
+                f"Requested raster too large: {width}x{height} pixels. "
+                f"Max is {max_pixels}x{max_pixels}. "
+                f"Consider using a coarser resolution or increasing --max-pixels."
+            )
 
         # Request coverage from WCS
         response = wcs.getCoverage(
@@ -130,6 +152,11 @@ def download_single_polygon(
         )
 
         downloaded_data = response.read()
+
+        # Check for WCS error response (XML error documents start with '<')
+        if downloaded_data.startswith(b'<') or downloaded_data.startswith(b'<?'):
+            error_preview = downloaded_data[:500].decode('utf-8', errors='replace')
+            raise ValueError(f"WCS returned error response: {error_preview}")
 
         # Write to temp file, process, and clean up
         with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
@@ -192,6 +219,8 @@ def process_polygons(
     sleep_duration: float,
     wcs_url: str,
     coverage_id: str,
+    resolution: float,
+    max_pixels: int,
 ) -> tuple[int, int, int, list[FailedPolygon]]:
     """
     Process all polygons with parallel downloads.
@@ -204,11 +233,12 @@ def process_polygons(
     polygon_gdf = gpd.read_parquet(input_parquet)
 
     # Reproject to EPSG:25833 if needed (WCS expects UTM coordinates)
+    target_crs = CRS.from_epsg(25833)
     if polygon_gdf.crs is None:
         console.print("[yellow]Warning: No CRS found, assuming EPSG:25833[/yellow]")
         polygon_gdf = polygon_gdf.set_crs("EPSG:25833")
-    elif polygon_gdf.crs.to_epsg() != 25833:
-        console.print(f"[yellow]Reprojecting from {polygon_gdf.crs.to_epsg()} to EPSG:25833...[/yellow]")
+    elif not polygon_gdf.crs.equals(target_crs):
+        console.print(f"[yellow]Reprojecting from {polygon_gdf.crs} to EPSG:25833...[/yellow]")
         polygon_gdf = polygon_gdf.to_crs("EPSG:25833")
 
     bounds_df = polygon_gdf.bounds
@@ -246,6 +276,8 @@ def process_polygons(
                     coverage_id,
                     output_dir,
                     sleep_duration,
+                    resolution,
+                    max_pixels,
                 ): row
                 for row in bounds_df.itertuples()
             }
@@ -287,6 +319,8 @@ def main(
     output_dir: Annotated[Path, typer.Argument(help="Directory for output GeoTIFF files")],
     workers: Annotated[int, typer.Option("--workers", "-w", help="Number of parallel workers")] = 4,
     sleep: Annotated[float, typer.Option("--sleep", "-s", help="Seconds to sleep between requests per worker")] = 0.5,
+    resolution: Annotated[float, typer.Option("--resolution", "-r", help="Output resolution in meters per pixel")] = 1.0,
+    max_pixels: Annotated[int, typer.Option("--max-pixels", "-m", help="Maximum pixels per dimension")] = DEFAULT_MAX_PIXELS,
     wcs_url: Annotated[str, typer.Option("--wcs-url", help="WCS service URL")] = "https://wcs.geonorge.no/skwms1/wcs.hoyde-dtm-nhm-25833",
     coverage_id: Annotated[str, typer.Option("--coverage-id", help="Coverage identifier")] = "nhm_dtm_topo_25833",
 ) -> None:
@@ -299,10 +333,12 @@ def main(
     console.print()
     console.print("[bold blue]WCS Raster Downloader[/bold blue]")
     console.print("=" * 40)
-    console.print(f"Input:    {input_parquet}")
-    console.print(f"Output:   {output_dir}")
-    console.print(f"Workers:  {workers}")
-    console.print(f"Sleep:    {sleep}s")
+    console.print(f"Input:      {input_parquet}")
+    console.print(f"Output:     {output_dir}")
+    console.print(f"Workers:    {workers}")
+    console.print(f"Sleep:      {sleep}s")
+    console.print(f"Resolution: {resolution}m")
+    console.print(f"Max pixels: {max_pixels}")
     console.print()
 
     if not input_parquet.exists():
@@ -317,6 +353,8 @@ def main(
         sleep_duration=sleep,
         wcs_url=wcs_url,
         coverage_id=coverage_id,
+        resolution=resolution,
+        max_pixels=max_pixels,
     )
 
     # Print summary
