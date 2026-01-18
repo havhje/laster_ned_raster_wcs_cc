@@ -1,0 +1,17 @@
+[project]
+name = "laster-ned-raster-wcs-cc"
+version = "0.1.0"
+description = "CLI tool for downloading DTM rasters from Geonorge WCS service"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "geopandas>=0.14.0",
+    "geoutils>=0.1.0",
+    "owslib>=0.29.0",
+    "pyarrow>=14.0.0",
+]
+
+[project.scripts]
+wcs-downloader = "wcs_downloader:cli"
